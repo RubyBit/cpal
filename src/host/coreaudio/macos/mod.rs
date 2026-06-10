@@ -54,6 +54,13 @@ impl HostTrait for Host {
     fn default_output_device(&self) -> Option<Self::Device> {
         default_output_device()
     }
+
+    fn system_audio_device(&self) -> Option<Self::Device> {
+        // The global tap is not bound to a device; carry the current default output id as a
+        // harmless placeholder (the tap itself never uses it).
+        let placeholder = default_output_device().map(|d| d.audio_device_id).unwrap_or(0);
+        Some(Device::system_audio(placeholder))
+    }
 }
 
 /// Type alias for the error callback to reduce complexity

@@ -77,6 +77,10 @@ enum DeviceHandle {
     DefaultOutput,
     DefaultInput,
     Specific(Audio::IMMDevice),
+    /// System-wide capture (process loopback over the virtual process-loopback endpoint,
+    /// excluding our own process tree). Has no backing `IMMDevice`; the capture format is
+    /// derived from the default render endpoint's mix format.
+    SystemAudio,
 }
 
 /// An opaque type that identifies an end point.
@@ -356,10 +360,14 @@ fn enumerator_to_interface_type(enumerator: &str) -> Option<InterfaceType> {
 /// Used for virtual default-device GUIDs (`DEVINTERFACE_AUDIO_RENDER`/`DEVINTERFACE_AUDIO_CAPTURE`)
 /// so that the Windows audio engine automatically reroutes the stream when the system default
 /// device changes.
-unsafe fn activate_audio_interface_sync(
-    device_interface_path: windows::core::PWSTR,
+unsafe fn activate_audio_interface_sync<P0>(
+    device_interface_path: P0,
+    activation_params: Option<*const StructuredStorage::PROPVARIANT>,
     activation_timeout: Option<Duration>,
-) -> windows::core::Result<Audio::IAudioClient> {
+) -> windows::core::Result<Audio::IAudioClient>
+where
+    P0: windows::core::Param<windows::core::PCWSTR>,
+{
     use windows::core::IUnknown;
 
     #[windows::core::implement(Audio::IActivateAudioInterfaceCompletionHandler)]
@@ -398,7 +406,7 @@ unsafe fn activate_audio_interface_sync(
     Audio::ActivateAudioInterfaceAsync(
         device_interface_path,
         &Audio::IAudioClient::IID,
-        None,
+        activation_params,
         &handler,
     )?;
     // If a timeout was given use it; otherwise block until Windows calls ActivateCompleted.
@@ -416,8 +424,71 @@ unsafe fn activate_audio_interface_sync(
     result?.cast()
 }
 
+/// Activates a system-wide ("global") process-loopback `IAudioClient` that captures the
+/// mixdown of every process EXCEPT this one (its whole process tree), regardless of which
+/// output endpoint the audio is routed to.
+///
+/// This is the Windows counterpart to the macOS global CoreAudio tap. Unlike endpoint
+/// loopback (`AUDCLNT_STREAMFLAGS_LOOPBACK` on a render endpoint), it does not stop
+/// capturing when the user switches the default output device. The returned client is
+/// uninitialized; the caller specifies the capture format (the virtual process-loopback
+/// endpoint does not implement `GetMixFormat`).
+///
+/// Self-exclusion (vs. the macOS tap, which includes our own process) avoids capturing /
+/// re-entrant feedback of any audio this app itself plays; for a capture-only app the two
+/// behaviours are equivalent in practice.
+unsafe fn activate_process_loopback_client(
+    activation_timeout: Option<Duration>,
+) -> Result<Audio::IAudioClient, Error> {
+    use windows::Win32::System::Com::BLOB;
+    use windows::Win32::System::Variant::VT_BLOB;
+
+    let mut params = Audio::AUDIOCLIENT_ACTIVATION_PARAMS {
+        ActivationType: Audio::AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+        Anonymous: Audio::AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+            ProcessLoopbackParams: Audio::AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                TargetProcessId: Threading::GetCurrentProcessId(),
+                ProcessLoopbackMode: Audio::PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+            },
+        },
+    };
+
+    // Wrap the activation params in a VT_BLOB PROPVARIANT. `params` and `propvariant` live on
+    // this stack frame, which stays alive across the synchronous `activate_audio_interface_sync`
+    // call below (it blocks until `ActivateCompleted` fires), so the blob pointer stays valid.
+    //
+    // CRITICAL: `PROPVARIANT`'s Drop calls `PropVariantClear`, which for a VT_BLOB would
+    // `CoTaskMemFree(pBlobData)`. Our blob points at the stack `params`, not CoTaskMem-allocated
+    // memory, so letting it drop corrupts the heap. We wrap it in `ManuallyDrop` to suppress that
+    // free — the PROPVARIANT owns no heap memory of its own, so nothing leaks.
+    let mut propvariant = StructuredStorage::PROPVARIANT::default();
+    {
+        let inner = &mut *propvariant.Anonymous.Anonymous;
+        inner.vt = VT_BLOB;
+        inner.Anonymous.blob = BLOB {
+            cbSize: mem::size_of::<Audio::AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+            pBlobData: &mut params as *mut _ as *mut u8,
+        };
+    }
+    let propvariant = std::mem::ManuallyDrop::new(propvariant);
+
+    activate_audio_interface_sync(
+        Audio::VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+        Some(&*propvariant as *const _),
+        activation_timeout,
+    )
+    .map_err(Error::from)
+}
+
 impl Device {
     pub fn description(&self) -> Result<DeviceDescription, Error> {
+        if matches!(self.device, DeviceHandle::SystemAudio) {
+            return Ok(
+                DeviceDescriptionBuilder::new("System Audio (all applications)".to_string())
+                    .direction(DeviceDirection::Input)
+                    .build(),
+            );
+        }
         let device = self.immdevice().ok_or_else(|| {
             Error::with_message(ErrorKind::DeviceNotAvailable, "Default device not found")
         })?;
@@ -506,6 +577,12 @@ impl Device {
     }
 
     fn id(&self) -> Result<DeviceId, Error> {
+        if matches!(self.device, DeviceHandle::SystemAudio) {
+            return Ok(DeviceId::new(
+                crate::platform::HostId::Wasapi,
+                "system-audio",
+            ));
+        }
         let device = self.immdevice().ok_or_else(|| {
             Error::with_message(ErrorKind::DeviceNotAvailable, "Default device not found")
         })?;
@@ -544,21 +621,32 @@ impl Device {
         }
     }
 
+    /// The system-wide audio capture device (process loopback excluding our own process tree).
+    pub(crate) fn system_audio() -> Self {
+        Device {
+            device: DeviceHandle::SystemAudio,
+            future_audio_client: Arc::new(Mutex::new(None)),
+        }
+    }
+
     /// Returns the underlying `IMMDevice`, resolving the current one for default devices.
+    /// `None` for system audio, which has no backing endpoint.
     pub fn immdevice(&self) -> Option<Audio::IMMDevice> {
         match &self.device {
             DeviceHandle::DefaultOutput => current_default_endpoint(Audio::eRender),
             DeviceHandle::DefaultInput => current_default_endpoint(Audio::eCapture),
             DeviceHandle::Specific(device) => Some(device.clone()),
+            DeviceHandle::SystemAudio => None,
         }
     }
 
-    /// Creates a `DefaultDeviceMonitor` for default-device streams, or `None` for specific devices.
+    /// Creates a `DefaultDeviceMonitor` for default-device streams, or `None` otherwise.
+    /// System audio follows nothing (process loopback is endpoint-independent), so no monitor.
     fn default_device_monitor(&self) -> Result<Option<DefaultDeviceMonitor>, Error> {
         let flow = match &self.device {
             DeviceHandle::DefaultOutput => Audio::eRender,
             DeviceHandle::DefaultInput => Audio::eCapture,
-            DeviceHandle::Specific(_) => return Ok(None),
+            DeviceHandle::Specific(_) | DeviceHandle::SystemAudio => return Ok(None),
         };
         let enumerator = get_enumerator().0.clone();
         DefaultDeviceMonitor::new(enumerator, flow).map(Some)
@@ -582,13 +670,15 @@ impl Device {
                     let path = Com::StringFromIID(&Audio::DEVINTERFACE_AUDIO_RENDER)
                         .map_err(Error::from)?;
                     let _guard = ComString(path);
-                    activate_audio_interface_sync(path, activation_timeout).map_err(Error::from)?
+                    activate_audio_interface_sync(path, None, activation_timeout)
+                        .map_err(Error::from)?
                 }
                 DeviceHandle::DefaultInput => {
                     let path = Com::StringFromIID(&Audio::DEVINTERFACE_AUDIO_CAPTURE)
                         .map_err(Error::from)?;
                     let _guard = ComString(path);
-                    activate_audio_interface_sync(path, activation_timeout).map_err(Error::from)?
+                    activate_audio_interface_sync(path, None, activation_timeout)
+                        .map_err(Error::from)?
                 }
                 DeviceHandle::Specific(device) => {
                     // can fail if the device has been disconnected since we enumerated it, or if
@@ -596,6 +686,14 @@ impl Device {
                     device
                         .Activate(Com::CLSCTX_ALL, None)
                         .map_err(Error::from)?
+                }
+                DeviceHandle::SystemAudio => {
+                    // System audio never uses the cached endpoint client; the capture path
+                    // activates its own process-loopback client. Reaching here is a bug.
+                    return Err(Error::with_message(
+                        ErrorKind::UnsupportedOperation,
+                        "system-audio device has no endpoint audio client",
+                    ));
                 }
             }
         };
@@ -737,7 +835,25 @@ impl Device {
         }
     }
 
+    /// The capture format for system-audio (process loopback): the default render endpoint's
+    /// mix format. The virtual process-loopback endpoint has no queryable format of its own, so
+    /// the stream must be initialized with this format.
+    fn system_audio_format(&self) -> Result<SupportedStreamConfig, Error> {
+        Device::default_output().default_format()
+    }
+
     pub fn supported_input_configs(&self) -> Result<SupportedInputConfigs, Error> {
+        if matches!(self.device, DeviceHandle::SystemAudio) {
+            let cfg = self.system_audio_format()?;
+            return Ok(vec![SupportedStreamConfigRange {
+                channels: cfg.channels(),
+                min_sample_rate: cfg.sample_rate(),
+                max_sample_rate: cfg.sample_rate(),
+                buffer_size: cfg.buffer_size().clone(),
+                sample_format: cfg.sample_format(),
+            }]
+            .into_iter());
+        }
         if self.data_flow() == Audio::eCapture {
             self.supported_formats()
         // If it's an output device, assume no input formats.
@@ -805,6 +921,8 @@ impl Device {
         match &self.device {
             DeviceHandle::DefaultOutput => Audio::eRender,
             DeviceHandle::DefaultInput => Audio::eCapture,
+            // System audio is a capture source (supports input, not output).
+            DeviceHandle::SystemAudio => Audio::eCapture,
             DeviceHandle::Specific(device) => {
                 let endpoint = Endpoint::from(device.clone());
                 endpoint.data_flow()
@@ -813,6 +931,9 @@ impl Device {
     }
 
     pub fn default_input_config(&self) -> Result<SupportedStreamConfig, Error> {
+        if matches!(self.device, DeviceHandle::SystemAudio) {
+            return self.system_audio_format();
+        }
         if self.data_flow() == Audio::eCapture {
             self.default_format()
         } else {
@@ -847,10 +968,18 @@ impl Device {
             // It's not actually sure that this is required, but when in doubt do it.
             com::com_initialized();
 
+            // The system-audio device captures the whole-system mixdown via a process-loopback
+            // client (excluding our own process tree), independent of the output endpoint.
+            let is_process_loopback = matches!(self.device, DeviceHandle::SystemAudio);
+
             // Obtaining a `IAudioClient`.
-            let audio_client = self
-                .build_audioclient(activation_timeout)
-                .context("Failed to build audio client")?;
+            let audio_client = if is_process_loopback {
+                activate_process_loopback_client(activation_timeout)
+                    .context("Failed to activate process-loopback audio client")?
+            } else {
+                self.build_audioclient(activation_timeout)
+                    .context("Failed to build audio client")?
+            };
 
             // No further range validation: IAudioClient::Initialize accepts any positive duration
             // in shared mode. The callback period is always GetDevicePeriod() regardless of what
@@ -859,7 +988,10 @@ impl Device {
 
             let mut stream_flags = DEFAULT_FLAGS;
 
-            if self.data_flow() == Audio::eRender {
+            // LOOPBACK for endpoint loopback (output-as-input) AND for process loopback. The
+            // system-audio device reports `eCapture`, so it must be keyed on `is_process_loopback`
+            // separately: `data_flow() == eRender` alone would drop the flag for it.
+            if self.data_flow() == Audio::eRender || is_process_loopback {
                 stream_flags |= Audio::AUDCLNT_STREAMFLAGS_LOOPBACK;
             }
 
@@ -874,16 +1006,21 @@ impl Device {
                     })?;
                 let share_mode = Audio::AUDCLNT_SHAREMODE_SHARED;
 
-                // Ensure the format is supported.
-                match super::device::is_format_supported(&audio_client, &format_attempt.Format) {
-                    Ok(false) => {
-                        return Err(Error::with_message(
-                            ErrorKind::UnsupportedConfig,
-                            "Stream configuration is not supported in shared mode",
-                        ))
+                // Ensure the format is supported. Skipped for process loopback: the virtual
+                // process-loopback endpoint does not implement `IsFormatSupported`, so we trust
+                // the caller-supplied format (typically the default output device's mix format).
+                if !is_process_loopback {
+                    match super::device::is_format_supported(&audio_client, &format_attempt.Format)
+                    {
+                        Ok(false) => {
+                            return Err(Error::with_message(
+                                ErrorKind::UnsupportedConfig,
+                                "Stream configuration is not supported in shared mode",
+                            ))
+                        }
+                        Err(e) => return Err(e),
+                        _ => (),
                     }
-                    Err(e) => return Err(e),
-                    _ => (),
                 }
 
                 // Finally, initializing the audio client
@@ -927,12 +1064,23 @@ impl Device {
             // `run()` method and added to the `RunContext`.
             let client_flow = AudioClientFlow::Capture { capture_client };
 
-            let audio_clock = get_audio_clock(&audio_client)?;
+            // The process-loopback virtual client does not implement IAudioClock or report a
+            // stream latency. Tolerate both for that path (the `callback` timestamp falls back to
+            // QPC); a real capture device must still provide them.
+            let audio_clock = if is_process_loopback {
+                get_audio_clock(&audio_client).ok()
+            } else {
+                Some(get_audio_clock(&audio_client)?)
+            };
 
             let stream_latency = {
-                let hns = audio_client
-                    .GetStreamLatency()
-                    .context("Failed to get stream latency")?;
+                let hns = if is_process_loopback {
+                    audio_client.GetStreamLatency().unwrap_or(0)
+                } else {
+                    audio_client
+                        .GetStreamLatency()
+                        .context("Failed to get stream latency")?
+                };
                 Duration::from_nanos(hns.max(0) as u64 * 100)
             };
 
@@ -1040,7 +1188,7 @@ impl Device {
             // `run()` method and added to the `RunContext`.
             let client_flow = AudioClientFlow::Render { render_client };
 
-            let audio_clock = get_audio_clock(&audio_client)?;
+            let audio_clock = Some(get_audio_clock(&audio_client)?);
 
             let stream_latency = {
                 let hns = audio_client
@@ -1113,7 +1261,8 @@ impl PartialEq for Device {
     fn eq(&self, other: &Device) -> bool {
         match (&self.device, &other.device) {
             (DeviceHandle::DefaultOutput, DeviceHandle::DefaultOutput)
-            | (DeviceHandle::DefaultInput, DeviceHandle::DefaultInput) => true,
+            | (DeviceHandle::DefaultInput, DeviceHandle::DefaultInput)
+            | (DeviceHandle::SystemAudio, DeviceHandle::SystemAudio) => true,
             (DeviceHandle::Specific(a), DeviceHandle::Specific(b)) => {
                 // SAFETY: both IMMDevice handles are valid for the lifetime of their Device.
                 unsafe { endpoint_ids_equal(a, b) }
@@ -1128,7 +1277,9 @@ impl Eq for Device {}
 impl std::hash::Hash for Device {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match &self.device {
-            DeviceHandle::DefaultOutput | DeviceHandle::DefaultInput => {
+            DeviceHandle::DefaultOutput
+            | DeviceHandle::DefaultInput
+            | DeviceHandle::SystemAudio => {
                 mem::discriminant(&self.device).hash(state);
             }
             DeviceHandle::Specific(device) => {

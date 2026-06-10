@@ -80,6 +80,20 @@ pub trait HostTrait {
     /// Returns `None` if no output device is available.
     fn default_output_device(&self) -> Option<Self::Device>;
 
+    /// The system-wide audio capture device: the whole-system output mixdown, independent of
+    /// which output device the audio is routed to.
+    ///
+    /// Call [`build_input_stream`](DeviceTrait::build_input_stream)
+    /// on it like any input device. It is distinct from endpoint loopback (using a specific
+    /// output device as an input device), which captures only one endpoint and stops if audio is
+    /// routed elsewhere.
+    ///
+    /// Returns `None` if the host or OS does not support system-wide capture. Supported on
+    /// WASAPI (Windows, process loopback) and CoreAudio (macOS, global process tap) currently.
+    fn system_audio_device(&self) -> Option<Self::Device> {
+        None
+    }
+
     /// An iterator yielding all `Device`s currently available to the system that support one or more
     /// input stream formats.
     ///

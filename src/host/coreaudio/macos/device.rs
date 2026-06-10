@@ -356,10 +356,23 @@ impl DeviceTrait for Device {
     }
 }
 
+/// What a [`Device`] represents. Distinguishes the physical/enumerated devices from the two
+/// synthetic ones (the system default output, and the system-wide capture tap).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum DeviceKind {
+    /// An ordinary enumerated device addressed by `audio_device_id`.
+    Physical,
+    /// Follows the current system default output (for the `DefaultOutput` AudioUnit mode).
+    DefaultOutput,
+    /// The whole-system capture tap (global process mixdown). `audio_device_id` is only a
+    /// placeholder; the tap is created fresh per stream and is not bound to any device.
+    SystemAudio,
+}
+
 #[derive(Clone)]
 pub struct Device {
     pub(crate) audio_device_id: AudioDeviceID,
-    pub(crate) is_default_output: bool,
+    pub(crate) kind: DeviceKind,
 }
 
 impl Device {
@@ -368,7 +381,15 @@ impl Device {
     pub fn new(audio_device_id: AudioDeviceID) -> Self {
         Self {
             audio_device_id,
-            is_default_output: false,
+            kind: DeviceKind::Physical,
+        }
+    }
+
+    /// Construct the synthetic system-wide audio capture device.
+    pub(crate) fn system_audio(audio_device_id: AudioDeviceID) -> Self {
+        Self {
+            audio_device_id,
+            kind: DeviceKind::SystemAudio,
         }
     }
 
@@ -403,6 +424,14 @@ impl Device {
     }
 
     fn description(&self) -> Result<crate::DeviceDescription, Error> {
+        if self.kind == DeviceKind::SystemAudio {
+            return Ok(DeviceDescriptionBuilder::new(
+                "System Audio (all applications)".to_string(),
+            )
+            .direction(crate::DeviceDirection::Input)
+            .build());
+        }
+
         let name = get_device_name(self.audio_device_id).context("Failed to get device name")?;
 
         let input_configs = self
@@ -428,6 +457,10 @@ impl Device {
     }
 
     fn id(&self) -> Result<DeviceId, Error> {
+        if self.kind == DeviceKind::SystemAudio {
+            return Ok(DeviceId::new(crate::platform::HostId::CoreAudio, "system-audio"));
+        }
+
         let property_address = AudioObjectPropertyAddress {
             mSelector: kAudioDevicePropertyDeviceUID,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -587,11 +620,44 @@ impl Device {
         }
     }
 
+    /// The capture format for the system-audio tap: the default output device's format, but
+    /// stereo (the global mixdown tap is always stereo F32). Used instead of querying the
+    /// placeholder device, which is not the tap and may not match.
+    fn system_audio_config(&self) -> Result<SupportedStreamConfig, Error> {
+        let output = super::enumerate::default_output_device().ok_or_else(|| {
+            Error::with_message(
+                ErrorKind::DeviceNotAvailable,
+                "no default output device to derive system-audio format",
+            )
+        })?;
+        let cfg = output.default_output_config()?;
+        Ok(SupportedStreamConfig {
+            channels: 2,
+            sample_rate: cfg.sample_rate(),
+            buffer_size: cfg.buffer_size().clone(),
+            sample_format: SampleFormat::F32,
+        })
+    }
+
     fn supported_input_configs(&self) -> Result<SupportedOutputConfigs, Error> {
+        if self.kind == DeviceKind::SystemAudio {
+            let cfg = self.system_audio_config()?;
+            return Ok(vec![SupportedStreamConfigRange {
+                channels: cfg.channels(),
+                min_sample_rate: cfg.sample_rate(),
+                max_sample_rate: cfg.sample_rate(),
+                buffer_size: cfg.buffer_size().clone(),
+                sample_format: cfg.sample_format(),
+            }]
+            .into_iter());
+        }
         self.supported_configs(kAudioObjectPropertyScopeInput)
     }
 
     fn supported_output_configs(&self) -> Result<SupportedOutputConfigs, Error> {
+        if self.kind == DeviceKind::SystemAudio {
+            return Ok(vec![].into_iter());
+        }
         self.supported_configs(kAudioObjectPropertyScopeOutput)
     }
 
@@ -672,15 +738,27 @@ impl Device {
     }
 
     fn default_input_config(&self) -> Result<SupportedStreamConfig, Error> {
+        if self.kind == DeviceKind::SystemAudio {
+            return self.system_audio_config();
+        }
         self.default_config(kAudioObjectPropertyScopeInput)
     }
 
     fn default_output_config(&self) -> Result<SupportedStreamConfig, Error> {
+        if self.kind == DeviceKind::SystemAudio {
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedOperation,
+                "system-audio device does not support output",
+            ));
+        }
         self.default_config(kAudioObjectPropertyScopeOutput)
     }
 
     /// Check if this device supports input (recording).
     fn supports_input(&self) -> bool {
+        if self.kind == DeviceKind::SystemAudio {
+            return true;
+        }
         // Check if the device has input channels by trying to get its input configuration
         self.supported_input_configs()
             .map(|mut configs| configs.next().is_some())
@@ -712,26 +790,43 @@ impl Device {
         // Set the physical stream format (bit depth + sample rate) on the hardware device.
         // This avoids unnecessary format conversions, which is especially important on aggregate
         // devices. Falls back to sample-rate-only if no matching physical format is available.
-        if set_physical_format(
-            self.audio_device_id,
-            config.sample_rate,
-            config.channels,
-            sample_format,
-        )
-        .is_err()
+        //
+        // Skipped for the system-audio tap: the captured mixdown is independent of `self` (whose
+        // id is only a placeholder), so forcing its physical format is pointless, it
+        // can disrupt the user's output (e.g. flip a surround/44.1k device) and a nominal-rate
+        // change fires CoreAudio's rate listener. The tap's aggregate format is
+        // configured below. Direct input and endpoint loopback keep the original behavior.
+        if self.kind != DeviceKind::SystemAudio
+            && set_physical_format(
+                self.audio_device_id,
+                config.sample_rate,
+                config.channels,
+                sample_format,
+            )
+            .is_err()
         {
             set_sample_rate(self.audio_device_id, config.sample_rate, timeout)?;
         }
 
+        // SystemAudio -> global system tap (not bound to any device). Otherwise do a direct input if
+        // the device has input channels, else endpoint loopback of this output device.
         let mut loopback_aggregate: Option<LoopbackDevice> = None;
-        let mut audio_unit = if self.supports_input() {
-            audio_unit_from_device(self, AudioUnitMode::Input)?
-        } else {
-            loopback_aggregate.replace(LoopbackDevice::from_device(self)?);
-            audio_unit_from_device(
-                &loopback_aggregate.as_ref().unwrap().aggregate_device,
-                AudioUnitMode::Input,
-            )?
+        let mut audio_unit = match self.kind {
+            DeviceKind::SystemAudio => {
+                loopback_aggregate.replace(LoopbackDevice::global()?);
+                audio_unit_from_device(
+                    &loopback_aggregate.as_ref().unwrap().aggregate_device,
+                    AudioUnitMode::Input,
+                )?
+            }
+            _ if self.supports_input() => audio_unit_from_device(self, AudioUnitMode::Input)?,
+            _ => {
+                loopback_aggregate.replace(LoopbackDevice::from_device(self)?);
+                audio_unit_from_device(
+                    &loopback_aggregate.as_ref().unwrap().aggregate_device,
+                    AudioUnitMode::Input,
+                )?
+            }
         };
 
         // Configure stream format and buffer size for predictable callback behavior.
@@ -824,6 +919,12 @@ impl Device {
         E: FnMut(Error) + Send + 'static,
     {
         crate::validate_stream_config(&config)?;
+        if self.kind == DeviceKind::SystemAudio {
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedOperation,
+                "system-audio device is capture-only",
+            ));
+        }
         // Best-effort: set the physical stream format (bit depth + sample rate) on the hardware.
         // This avoids unnecessary conversions, especially on aggregate devices. Not an error if
         // it fails — the AudioUnit will handle format conversion as before.
@@ -838,7 +939,7 @@ impl Device {
             set_sample_rate(self.audio_device_id, config.sample_rate, timeout)?;
         }
 
-        let mode = if self.is_default_output {
+        let mode = if self.kind == DeviceKind::DefaultOutput {
             AudioUnitMode::DefaultOutput
         } else {
             AudioUnitMode::Output
@@ -930,7 +1031,12 @@ impl Device {
 
 impl PartialEq for Device {
     fn eq(&self, other: &Self) -> bool {
-        self.audio_device_id == other.audio_device_id
+        // All system-audio handles are equal regardless of placeholder id; others compare by id.
+        match (self.kind, other.kind) {
+            (DeviceKind::SystemAudio, DeviceKind::SystemAudio) => true,
+            (DeviceKind::SystemAudio, _) | (_, DeviceKind::SystemAudio) => false,
+            _ => self.audio_device_id == other.audio_device_id,
+        }
     }
 }
 
@@ -945,7 +1051,11 @@ impl fmt::Display for Device {
 
 impl std::hash::Hash for Device {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.audio_device_id.hash(state);
+        // Hash consistently with PartialEq: all system-audio handles hash alike.
+        match self.kind {
+            DeviceKind::SystemAudio => DeviceKind::SystemAudio.hash(state),
+            _ => self.audio_device_id.hash(state),
+        }
     }
 }
 

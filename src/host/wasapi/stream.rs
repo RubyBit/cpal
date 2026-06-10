@@ -289,7 +289,9 @@ pub enum AudioClientFlow {
 
 pub struct StreamInner {
     pub audio_client: Audio::IAudioClient,
-    pub audio_clock: Audio::IAudioClock,
+    /// `None` for the process-loopback capture client, which does not expose `IAudioClock`;
+    /// the `callback` timestamp then falls back to QueryPerformanceCounter (see `stream_instant`).
+    pub audio_clock: Option<Audio::IAudioClock>,
     pub client_flow: AudioClientFlow,
     // Event that is signalled by WASAPI whenever audio data must be written.
     pub event: Foundation::HANDLE,
@@ -826,15 +828,38 @@ fn process_output(
 /// Uses the QPC position produced via the `GetPosition` method.
 #[inline]
 fn stream_instant(stream: &StreamInner) -> Result<StreamInstant, Error> {
-    let mut position: u64 = 0;
-    let mut qpc_position: u64 = 0;
-    unsafe {
-        stream
-            .audio_clock
-            .GetPosition(&mut position, Some(&mut qpc_position))
-            .context("Failed to get clock position")?;
+    // `qpc_position` is in 100-nanosecond units.
+    let qpc_position: u64 = match &stream.audio_clock {
+        Some(audio_clock) => {
+            let mut position: u64 = 0;
+            let mut qpc_position: u64 = 0;
+            unsafe {
+                audio_clock
+                    .GetPosition(&mut position, Some(&mut qpc_position))
+                    .context("Failed to get clock position")?;
+            }
+            qpc_position
+        }
+        // Process-loopback capture has no IAudioClock; derive "now" from QPC directly, matching
+        // the 100 ns grid of WASAPI QPCPosition values (same conversion as `Stream::now`).
+        None => {
+            let mut counter: i64 = 0;
+            let mut frequency: i64 = 0;
+            unsafe {
+                Performance::QueryPerformanceCounter(&mut counter)
+                    .context("QueryPerformanceCounter failed")?;
+                Performance::QueryPerformanceFrequency(&mut frequency)
+                    .context("QueryPerformanceFrequency failed")?;
+            }
+            if frequency <= 0 {
+                return Err(Error::with_message(
+                    ErrorKind::BackendError,
+                    "QueryPerformanceFrequency returned zero",
+                ));
+            }
+            (counter as u128 * 10_000_000 / frequency as u128) as u64
+        }
     };
-    // The `qpc_position` is in 100-nanosecond units.
     let nanos = qpc_position as u128 * 100;
     let instant = StreamInstant::new(
         (nanos / 1_000_000_000) as u64,

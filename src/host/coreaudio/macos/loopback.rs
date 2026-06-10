@@ -81,15 +81,10 @@ pub struct LoopbackDevice {
 }
 
 impl LoopbackDevice {
-    /// Create a [`LoopbackDevice`] that records the sound
-    /// output of `device`.
+    /// Create a [`LoopbackDevice`] that records only the audio routed to `device`'s output
+    /// endpoint. Capture stops if audio is routed to a different output device.
     pub fn from_device(device: &Device) -> Result<Self, Error> {
-        // 1 - Create tap
-
-        let pid = std::process::id();
-        let instance = AGGREGATE_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-
-        // Empty list of processes as we want to record all processes
+        // Empty process list + device UID => record everything routed to `device`.
         let processes = NSArray::new();
         let device_uid = device.uid()?;
         let tap_desc = unsafe {
@@ -100,6 +95,28 @@ impl LoopbackDevice {
                 0,
             )
         };
+        Self::from_tap_description(tap_desc)
+    }
+
+    /// Create a [`LoopbackDevice`] that records a system-wide global mixdown of every process,
+    /// It is NOT bound to any output device, so switching the default output does not stop capture.
+    pub fn global() -> Result<Self, Error> {
+        let exclude = NSArray::new();
+        let tap_desc = unsafe {
+            CATapDescription::initStereoGlobalTapButExcludeProcesses(
+                CATapDescription::alloc(),
+                &exclude,
+            )
+        };
+        Self::from_tap_description(tap_desc)
+    }
+
+    /// Shared tail: configure the tap description, create the process tap, and wrap it in an
+    /// aggregate device (destroyed on drop).
+    fn from_tap_description(tap_desc: Retained<CATapDescription>) -> Result<Self, Error> {
+        let pid = std::process::id();
+        let instance = AGGREGATE_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+
         unsafe {
             tap_desc.setMuteBehavior(CATapMuteBehavior::Unmuted); // captured audio still goes to speakers
             tap_desc.setName(&NSString::from_str(&format!(

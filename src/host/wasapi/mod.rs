@@ -52,6 +52,10 @@ impl HostTrait for Host {
     fn default_output_device(&self) -> Option<Self::Device> {
         default_output_device()
     }
+
+    fn system_audio_device(&self) -> Option<Self::Device> {
+        Some(Device::system_audio())
+    }
 }
 
 impl From<windows::core::Error> for Error {

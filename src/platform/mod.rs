@@ -582,6 +582,17 @@ macro_rules! impl_platform_host {
                     )*
                 }
             }
+
+            fn system_audio_device(&self) -> Option<Self::Device> {
+                match self.0 {
+                    $(
+                        $(#[cfg($feat)])?
+                        HostInner::$HostVariant(ref h) => {
+                            h.system_audio_device().map(DeviceInner::$HostVariant).map(Device::from)
+                        }
+                    )*
+                }
+            }
         }
 
         impl crate::traits::StreamTrait for Stream {
