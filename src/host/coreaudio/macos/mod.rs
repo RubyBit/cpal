@@ -6,10 +6,17 @@ use std::{
 
 use coreaudio::audio_unit::AudioUnit;
 use objc2_core_audio::{
-    kAudioDevicePropertyDeviceIsAlive, kAudioDevicePropertyNominalSampleRate,
-    kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, AudioDeviceID, AudioObjectID,
-    AudioObjectPropertyAddress,
+    kAudioAggregateDevicePropertyActiveSubDeviceList, kAudioAggregateDevicePropertyClockDevice,
+    kAudioAggregateDevicePropertyComposition, kAudioAggregateDevicePropertyFullSubDeviceList,
+    kAudioAggregateDevicePropertyMainSubDevice, kAudioAggregateDevicePropertySubTapList,
+    kAudioAggregateDevicePropertyTapList, kAudioDevicePropertyDeviceIsAlive,
+    kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreamConfiguration,
+    kAudioDevicePropertyStreamFormat, kAudioHardwarePropertyDefaultOutputDevice,
+    kAudioHardwarePropertyDevices, kAudioHardwarePropertyTapList, kAudioObjectPropertyElementMain,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
+    kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, kAudioTapPropertyDescription,
+    kAudioTapPropertyFormat, AudioDeviceID, AudioObjectID, AudioObjectPropertyAddress,
+    AudioObjectPropertyScope, AudioObjectPropertySelector,
 };
 use property_listener::AudioObjectPropertyListener;
 
@@ -310,20 +317,15 @@ impl Monitor for DefaultOutputMonitor {
 
 #[derive(Copy, Clone, Debug)]
 enum SystemAudioListenerEvent {
-    AggregateDisconnected,
-    AggregateSampleRateChanged,
+    DeviceNotAvailable(&'static str),
+    StreamInvalidated(&'static str),
     DefaultOutputChanged,
-    DefaultOutputSampleRateChanged,
 }
 
 #[derive(Debug)]
 enum SystemAudioMonitorEvent {
-    AggregateDisconnected,
-    AggregateSampleRateChanged,
-    DefaultOutputChanged,
-    DefaultOutputUnavailable,
-    DefaultOutputSampleRateChanged,
-    ListenerFailed(Error),
+    DeviceNotAvailable(&'static str),
+    StreamInvalidated(&'static str),
 }
 
 fn check_shutdown(shutdown_rx: &mpsc::Receiver<()>) -> bool {
@@ -333,41 +335,297 @@ fn check_shutdown(shutdown_rx: &mpsc::Receiver<()>) -> bool {
     }
 }
 
-fn sample_rate_listener(
-    device_id: AudioDeviceID,
+fn property_address(
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope,
+) -> AudioObjectPropertyAddress {
+    AudioObjectPropertyAddress {
+        mSelector: selector,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain,
+    }
+}
+
+fn property_listener(
+    object_id: AudioObjectID,
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope,
     tx: mpsc::Sender<SystemAudioListenerEvent>,
     event: SystemAudioListenerEvent,
 ) -> Result<AudioObjectPropertyListener, Error> {
-    AudioObjectPropertyListener::new(
-        device_id,
-        AudioObjectPropertyAddress {
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain,
-        },
-        move || {
-            let _ = tx.send(event);
-        },
-    )
+    AudioObjectPropertyListener::new(object_id, property_address(selector, scope), move || {
+        let _ = tx.send(event);
+    })
 }
 
-fn default_output_sample_rate_listener(
+fn push_optional_listener(
+    listeners: &mut Vec<AudioObjectPropertyListener>,
+    listener: Result<AudioObjectPropertyListener, Error>,
+) {
+    if let Ok(listener) = listener {
+        listeners.push(listener);
+    }
+}
+
+fn aggregate_property_listeners(
+    aggregate_device_id: AudioDeviceID,
+    tx: mpsc::Sender<SystemAudioListenerEvent>,
+) -> Result<Vec<AudioObjectPropertyListener>, Error> {
+    let mut listeners = Vec::new();
+    listeners.push(property_listener(
+        aggregate_device_id,
+        kAudioDevicePropertyDeviceIsAlive,
+        kAudioObjectPropertyScopeGlobal,
+        tx.clone(),
+        SystemAudioListenerEvent::DeviceNotAvailable("system audio aggregate device disconnected"),
+    )?);
+    listeners.push(property_listener(
+        aggregate_device_id,
+        kAudioDevicePropertyNominalSampleRate,
+        kAudioObjectPropertyScopeGlobal,
+        tx.clone(),
+        SystemAudioListenerEvent::StreamInvalidated("system audio aggregate sample rate changed"),
+    )?);
+
+    push_optional_listener(
+        &mut listeners,
+        property_listener(
+            aggregate_device_id,
+            kAudioDevicePropertyStreamFormat,
+            kAudioObjectPropertyScopeInput,
+            tx.clone(),
+            SystemAudioListenerEvent::StreamInvalidated(
+                "system audio aggregate input stream format changed",
+            ),
+        ),
+    );
+    push_optional_listener(
+        &mut listeners,
+        property_listener(
+            aggregate_device_id,
+            kAudioDevicePropertyStreamConfiguration,
+            kAudioObjectPropertyScopeInput,
+            tx.clone(),
+            SystemAudioListenerEvent::StreamInvalidated(
+                "system audio aggregate input stream configuration changed",
+            ),
+        ),
+    );
+    push_optional_listener(
+        &mut listeners,
+        property_listener(
+            aggregate_device_id,
+            kAudioAggregateDevicePropertyFullSubDeviceList,
+            kAudioObjectPropertyScopeGlobal,
+            tx.clone(),
+            SystemAudioListenerEvent::StreamInvalidated(
+                "system audio aggregate subdevice list changed",
+            ),
+        ),
+    );
+    push_optional_listener(
+        &mut listeners,
+        property_listener(
+            aggregate_device_id,
+            kAudioAggregateDevicePropertyActiveSubDeviceList,
+            kAudioObjectPropertyScopeGlobal,
+            tx.clone(),
+            SystemAudioListenerEvent::StreamInvalidated(
+                "system audio aggregate active subdevice list changed",
+            ),
+        ),
+    );
+    push_optional_listener(
+        &mut listeners,
+        property_listener(
+            aggregate_device_id,
+            kAudioAggregateDevicePropertyTapList,
+            kAudioObjectPropertyScopeGlobal,
+            tx.clone(),
+            SystemAudioListenerEvent::StreamInvalidated("system audio aggregate tap list changed"),
+        ),
+    );
+    push_optional_listener(
+        &mut listeners,
+        property_listener(
+            aggregate_device_id,
+            kAudioAggregateDevicePropertySubTapList,
+            kAudioObjectPropertyScopeGlobal,
+            tx.clone(),
+            SystemAudioListenerEvent::StreamInvalidated(
+                "system audio aggregate subtap list changed",
+            ),
+        ),
+    );
+    push_optional_listener(
+        &mut listeners,
+        property_listener(
+            aggregate_device_id,
+            kAudioAggregateDevicePropertyComposition,
+            kAudioObjectPropertyScopeGlobal,
+            tx.clone(),
+            SystemAudioListenerEvent::StreamInvalidated(
+                "system audio aggregate composition changed",
+            ),
+        ),
+    );
+    push_optional_listener(
+        &mut listeners,
+        property_listener(
+            aggregate_device_id,
+            kAudioAggregateDevicePropertyMainSubDevice,
+            kAudioObjectPropertyScopeGlobal,
+            tx.clone(),
+            SystemAudioListenerEvent::StreamInvalidated(
+                "system audio aggregate main subdevice changed",
+            ),
+        ),
+    );
+    push_optional_listener(
+        &mut listeners,
+        property_listener(
+            aggregate_device_id,
+            kAudioAggregateDevicePropertyClockDevice,
+            kAudioObjectPropertyScopeGlobal,
+            tx,
+            SystemAudioListenerEvent::StreamInvalidated(
+                "system audio aggregate clock device changed",
+            ),
+        ),
+    );
+
+    Ok(listeners)
+}
+
+fn tap_property_listeners(
+    tap_id: AudioObjectID,
+    tx: mpsc::Sender<SystemAudioListenerEvent>,
+) -> Vec<AudioObjectPropertyListener> {
+    let mut listeners = Vec::new();
+    push_optional_listener(
+        &mut listeners,
+        property_listener(
+            tap_id,
+            kAudioTapPropertyFormat,
+            kAudioObjectPropertyScopeGlobal,
+            tx.clone(),
+            SystemAudioListenerEvent::StreamInvalidated("system audio tap format changed"),
+        ),
+    );
+    push_optional_listener(
+        &mut listeners,
+        property_listener(
+            tap_id,
+            kAudioTapPropertyDescription,
+            kAudioObjectPropertyScopeGlobal,
+            tx,
+            SystemAudioListenerEvent::StreamInvalidated("system audio tap description changed"),
+        ),
+    );
+    listeners
+}
+
+fn system_audio_global_property_listeners(
+    tx: mpsc::Sender<SystemAudioListenerEvent>,
+) -> Result<Vec<AudioObjectPropertyListener>, Error> {
+    let mut listeners = Vec::new();
+    listeners.push(property_listener(
+        kAudioObjectSystemObject as AudioObjectID,
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        tx.clone(),
+        SystemAudioListenerEvent::DefaultOutputChanged,
+    )?);
+    push_optional_listener(
+        &mut listeners,
+        property_listener(
+            kAudioObjectSystemObject as AudioObjectID,
+            kAudioHardwarePropertyDevices,
+            kAudioObjectPropertyScopeGlobal,
+            tx.clone(),
+            SystemAudioListenerEvent::StreamInvalidated(
+                "system audio hardware device list changed",
+            ),
+        ),
+    );
+    push_optional_listener(
+        &mut listeners,
+        property_listener(
+            kAudioObjectSystemObject as AudioObjectID,
+            kAudioHardwarePropertyTapList,
+            kAudioObjectPropertyScopeGlobal,
+            tx,
+            SystemAudioListenerEvent::StreamInvalidated("system audio hardware tap list changed"),
+        ),
+    );
+
+    Ok(listeners)
+}
+
+fn default_output_property_listeners(
     default_output_id: Option<AudioDeviceID>,
     tx: mpsc::Sender<SystemAudioListenerEvent>,
-) -> Result<Option<AudioObjectPropertyListener>, Error> {
-    default_output_id
-        .map(|device_id| {
-            sample_rate_listener(
-                device_id,
-                tx,
-                SystemAudioListenerEvent::DefaultOutputSampleRateChanged,
-            )
-        })
-        .transpose()
+) -> Vec<AudioObjectPropertyListener> {
+    let Some(default_output_id) = default_output_id else {
+        return Vec::new();
+    };
+
+    let mut listeners = Vec::new();
+    push_optional_listener(
+        &mut listeners,
+        property_listener(
+            default_output_id,
+            kAudioDevicePropertyNominalSampleRate,
+            kAudioObjectPropertyScopeGlobal,
+            tx.clone(),
+            SystemAudioListenerEvent::StreamInvalidated(
+                "system audio default output sample rate changed",
+            ),
+        ),
+    );
+    push_optional_listener(
+        &mut listeners,
+        property_listener(
+            default_output_id,
+            kAudioDevicePropertyStreamFormat,
+            kAudioObjectPropertyScopeOutput,
+            tx.clone(),
+            SystemAudioListenerEvent::StreamInvalidated(
+                "system audio default output stream format changed",
+            ),
+        ),
+    );
+    push_optional_listener(
+        &mut listeners,
+        property_listener(
+            default_output_id,
+            kAudioDevicePropertyStreamConfiguration,
+            kAudioObjectPropertyScopeOutput,
+            tx.clone(),
+            SystemAudioListenerEvent::StreamInvalidated(
+                "system audio default output stream configuration changed",
+            ),
+        ),
+    );
+    push_optional_listener(
+        &mut listeners,
+        property_listener(
+            default_output_id,
+            kAudioDevicePropertyDeviceIsAlive,
+            kAudioObjectPropertyScopeGlobal,
+            tx,
+            SystemAudioListenerEvent::StreamInvalidated(
+                "system audio default output availability changed",
+            ),
+        ),
+    );
+
+    listeners
 }
 
 fn spawn_system_audio_monitor_thread(
     aggregate_device_id: AudioDeviceID,
+    tap_id: AudioObjectID,
 ) -> Result<(mpsc::Receiver<SystemAudioMonitorEvent>, mpsc::Sender<()>), Error> {
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     let (monitor_tx, monitor_rx) = mpsc::channel();
@@ -375,72 +633,27 @@ fn spawn_system_audio_monitor_thread(
     let (ready_tx, ready_rx) = mpsc::channel();
 
     std::thread::spawn(move || {
-        let aggregate_alive_tx = listener_tx.clone();
-        let aggregate_alive_listener = AudioObjectPropertyListener::new(
-            aggregate_device_id,
-            AudioObjectPropertyAddress {
-                mSelector: kAudioDevicePropertyDeviceIsAlive,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain,
-            },
-            move || {
-                let _ = aggregate_alive_tx.send(SystemAudioListenerEvent::AggregateDisconnected);
-            },
-        );
-        let aggregate_alive_listener = match aggregate_alive_listener {
-            Ok(listener) => listener,
-            Err(err) => {
-                let _ = ready_tx.send(Err(err));
-                return;
-            }
-        };
-
-        let aggregate_rate_listener = sample_rate_listener(
-            aggregate_device_id,
-            listener_tx.clone(),
-            SystemAudioListenerEvent::AggregateSampleRateChanged,
-        );
-        let aggregate_rate_listener = match aggregate_rate_listener {
-            Ok(listener) => listener,
-            Err(err) => {
-                let _ = ready_tx.send(Err(err));
-                return;
-            }
-        };
-
-        let default_output_tx = listener_tx.clone();
-        let default_output_listener = AudioObjectPropertyListener::new(
-            kAudioObjectSystemObject as AudioObjectID,
-            AudioObjectPropertyAddress {
-                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain,
-            },
-            move || {
-                let _ = default_output_tx.send(SystemAudioListenerEvent::DefaultOutputChanged);
-            },
-        );
-        let default_output_listener = match default_output_listener {
-            Ok(listener) => listener,
-            Err(err) => {
-                let _ = ready_tx.send(Err(err));
-                return;
-            }
-        };
-
-        let mut default_output_id = default_output_device().map(|d| d.audio_device_id);
-        let mut _default_rate_listener =
-            match default_output_sample_rate_listener(default_output_id, listener_tx.clone()) {
-                Ok(listener) => listener,
+        let mut _listeners =
+            match aggregate_property_listeners(aggregate_device_id, listener_tx.clone()) {
+                Ok(listeners) => listeners,
                 Err(err) => {
                     let _ = ready_tx.send(Err(err));
                     return;
                 }
             };
+        match system_audio_global_property_listeners(listener_tx.clone()) {
+            Ok(mut listeners) => _listeners.append(&mut listeners),
+            Err(err) => {
+                let _ = ready_tx.send(Err(err));
+                return;
+            }
+        }
+        _listeners.append(&mut tap_property_listeners(tap_id, listener_tx.clone()));
 
-        let _aggregate_alive_listener = aggregate_alive_listener;
-        let _aggregate_rate_listener = aggregate_rate_listener;
-        let _default_output_listener = default_output_listener;
+        let mut default_output_id = default_output_device().map(|d| d.audio_device_id);
+        let mut _default_output_listeners =
+            default_output_property_listeners(default_output_id, listener_tx.clone());
+
         let _ = ready_tx.send(Ok(()));
 
         loop {
@@ -455,43 +668,24 @@ fn spawn_system_audio_monitor_thread(
             };
 
             match event {
-                SystemAudioListenerEvent::AggregateDisconnected => {
-                    let _ = monitor_tx.send(SystemAudioMonitorEvent::AggregateDisconnected);
+                SystemAudioListenerEvent::DeviceNotAvailable(message) => {
+                    let _ = monitor_tx.send(SystemAudioMonitorEvent::DeviceNotAvailable(message));
                 }
-                SystemAudioListenerEvent::AggregateSampleRateChanged => {
-                    let _ = monitor_tx.send(SystemAudioMonitorEvent::AggregateSampleRateChanged);
-                }
-                SystemAudioListenerEvent::DefaultOutputSampleRateChanged => {
-                    let _ =
-                        monitor_tx.send(SystemAudioMonitorEvent::DefaultOutputSampleRateChanged);
+                SystemAudioListenerEvent::StreamInvalidated(message) => {
+                    let _ = monitor_tx.send(SystemAudioMonitorEvent::StreamInvalidated(message));
                 }
                 SystemAudioListenerEvent::DefaultOutputChanged => {
                     default_output_id = default_output_device().map(|d| d.audio_device_id);
-                    match default_output_sample_rate_listener(
-                        default_output_id,
-                        listener_tx.clone(),
-                    ) {
-                        Ok(listener) => {
-                            _default_rate_listener = listener;
-                            if default_output_id.is_some() {
-                                let _ =
-                                    monitor_tx.send(SystemAudioMonitorEvent::DefaultOutputChanged);
-                            } else {
-                                let _ = monitor_tx
-                                    .send(SystemAudioMonitorEvent::DefaultOutputUnavailable);
-                            }
-                        }
-                        Err(err) => {
-                            _default_rate_listener = None;
-                            let _ = monitor_tx.send(SystemAudioMonitorEvent::ListenerFailed(
-                                Error::with_message(
-                                    ErrorKind::StreamInvalidated,
-                                    format!(
-                                        "failed to monitor system-audio default output sample rate: {err}"
-                                    ),
-                                ),
-                            ));
-                        }
+                    _default_output_listeners =
+                        default_output_property_listeners(default_output_id, listener_tx.clone());
+                    if default_output_id.is_some() {
+                        let _ = monitor_tx.send(SystemAudioMonitorEvent::StreamInvalidated(
+                            "system audio default output changed",
+                        ));
+                    } else {
+                        let _ = monitor_tx.send(SystemAudioMonitorEvent::DeviceNotAvailable(
+                            "no default output device for system audio",
+                        ));
                     }
                 }
             }
@@ -510,9 +704,10 @@ fn spawn_system_audio_monitor_thread(
 
 /// Watches the moving clock/format inputs behind the global system-audio tap.
 ///
-/// The tap itself is global, but the aggregate device used for IO still has a live clock domain.
-/// A default-output or nominal-rate change can invalidate that stream configuration, so these
-/// events are reported as `StreamInvalidated` and downstream should rebuild the stream.
+/// The placeholder `Device` id is not meaningful for the tap. The live IO surfaces are the
+/// private aggregate device, the tap object, the current default output's format, and CoreAudio's
+/// hardware/tap lists. Bluetooth profile flips can change any of those without looking like a
+/// clean default-output device change.
 struct SystemAudioMonitor {
     latch: Latch,
     _shutdown_tx: mpsc::Sender<()>,
@@ -521,10 +716,12 @@ struct SystemAudioMonitor {
 impl SystemAudioMonitor {
     fn new(
         aggregate_device_id: AudioDeviceID,
+        tap_id: AudioObjectID,
         stream_weak: Weak<Mutex<StreamInner>>,
         error_callback: Arc<Mutex<ErrorCallback>>,
     ) -> Result<Self, Error> {
-        let (event_rx, shutdown_tx) = spawn_system_audio_monitor_thread(aggregate_device_id)?;
+        let (event_rx, shutdown_tx) =
+            spawn_system_audio_monitor_thread(aggregate_device_id, tap_id)?;
 
         let mut latch = Latch::new();
         let waiter = latch.waiter();
@@ -540,57 +737,15 @@ impl SystemAudioMonitor {
                         break;
                     };
 
+                    if let Ok(mut inner) = arc.try_lock() {
+                        let _ = inner.pause();
+                    };
                     let err = match event {
-                        SystemAudioMonitorEvent::AggregateDisconnected => {
-                            if let Ok(mut inner) = arc.try_lock() {
-                                let _ = inner.pause();
-                            }
-                            Error::with_message(
-                                ErrorKind::DeviceNotAvailable,
-                                "system audio aggregate device disconnected",
-                            )
+                        SystemAudioMonitorEvent::DeviceNotAvailable(message) => {
+                            Error::with_message(ErrorKind::DeviceNotAvailable, message)
                         }
-                        SystemAudioMonitorEvent::DefaultOutputUnavailable => {
-                            if let Ok(mut inner) = arc.try_lock() {
-                                let _ = inner.pause();
-                            }
-                            Error::with_message(
-                                ErrorKind::DeviceNotAvailable,
-                                "no default output device for system audio",
-                            )
-                        }
-                        SystemAudioMonitorEvent::AggregateSampleRateChanged => {
-                            if let Ok(mut inner) = arc.try_lock() {
-                                let _ = inner.pause();
-                            }
-                            Error::with_message(
-                                ErrorKind::StreamInvalidated,
-                                "system audio aggregate sample rate changed",
-                            )
-                        }
-                        SystemAudioMonitorEvent::DefaultOutputChanged => {
-                            if let Ok(mut inner) = arc.try_lock() {
-                                let _ = inner.pause();
-                            }
-                            Error::with_message(
-                                ErrorKind::StreamInvalidated,
-                                "system audio default output changed",
-                            )
-                        }
-                        SystemAudioMonitorEvent::DefaultOutputSampleRateChanged => {
-                            if let Ok(mut inner) = arc.try_lock() {
-                                let _ = inner.pause();
-                            }
-                            Error::with_message(
-                                ErrorKind::StreamInvalidated,
-                                "system audio default output sample rate changed",
-                            )
-                        }
-                        SystemAudioMonitorEvent::ListenerFailed(err) => {
-                            if let Ok(mut inner) = arc.try_lock() {
-                                let _ = inner.pause();
-                            }
-                            err
+                        SystemAudioMonitorEvent::StreamInvalidated(message) => {
+                            Error::with_message(ErrorKind::StreamInvalidated, message)
                         }
                     };
                     emit_error(&error_callback, err);

@@ -834,6 +834,7 @@ impl Device {
             .as_ref()
             .map(|l| l.aggregate_device.audio_device_id)
             .unwrap_or(self.audio_device_id);
+        let system_audio_tap_id = loopback_aggregate.as_ref().map(|l| l.tap_id);
         configure_stream_format_and_buffer(
             &mut audio_unit,
             config,
@@ -899,6 +900,12 @@ impl Device {
         let monitor: Box<dyn Monitor> = if self.kind == DeviceKind::SystemAudio {
             Box::new(SystemAudioMonitor::new(
                 effective_device_id,
+                system_audio_tap_id.ok_or_else(|| {
+                    Error::with_message(
+                        ErrorKind::DeviceNotAvailable,
+                        "system-audio tap was not created",
+                    )
+                })?,
                 weak_inner,
                 error_callback_disconnect,
             )?)
