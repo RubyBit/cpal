@@ -41,7 +41,7 @@ use objc2_core_foundation::{CFString, Type};
 pub use super::enumerate::{SupportedInputConfigs, SupportedOutputConfigs};
 use super::{
     asbd_from_config, check_os_status, host_time_to_stream_instant, DefaultOutputMonitor,
-    DisconnectManager, Monitor, Stream,
+    DisconnectManager, Monitor, Stream, SystemAudioMonitor,
 };
 use crate::{
     host::{
@@ -793,9 +793,9 @@ impl Device {
         //
         // Skipped for the system-audio tap: the captured mixdown is independent of `self` (whose
         // id is only a placeholder), so forcing its physical format is pointless, it
-        // can disrupt the user's output (e.g. flip a surround/44.1k device) and a nominal-rate
-        // change fires CoreAudio's rate listener. The tap's aggregate format is
-        // configured below. Direct input and endpoint loopback keep the original behavior.
+        // can disrupt the user's output (e.g. flip a surround/44.1k device). The tap's
+        // aggregate format is configured below, and output/aggregate clock changes are handled
+        // by the system-audio monitor. Direct input and endpoint loopback keep the original behavior.
         if self.kind != DeviceKind::SystemAudio
             && set_physical_format(
                 self.audio_device_id,
@@ -896,11 +896,19 @@ impl Device {
             _loopback_device: loopback_aggregate,
         }));
         let weak_inner = Arc::downgrade(&inner_arc);
-        let monitor: Box<dyn Monitor> = Box::new(DisconnectManager::new(
-            self.audio_device_id,
-            weak_inner,
-            error_callback_disconnect,
-        )?);
+        let monitor: Box<dyn Monitor> = if self.kind == DeviceKind::SystemAudio {
+            Box::new(SystemAudioMonitor::new(
+                effective_device_id,
+                weak_inner,
+                error_callback_disconnect,
+            )?)
+        } else {
+            Box::new(DisconnectManager::new(
+                self.audio_device_id,
+                weak_inner,
+                error_callback_disconnect,
+            )?)
+        };
         let stream = Stream::new(inner_arc, monitor);
         stream.signal_ready();
         Ok(stream)

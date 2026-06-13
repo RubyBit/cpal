@@ -1,5 +1,8 @@
 #![allow(deprecated)]
-use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::{
+    sync::{mpsc, Arc, Mutex, Weak},
+    time::Duration,
+};
 
 use coreaudio::audio_unit::AudioUnit;
 use objc2_core_audio::{
@@ -300,6 +303,315 @@ impl DefaultOutputMonitor {
 }
 
 impl Monitor for DefaultOutputMonitor {
+    fn signal_ready(&self) {
+        self.latch.release();
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum SystemAudioListenerEvent {
+    AggregateDisconnected,
+    AggregateSampleRateChanged,
+    DefaultOutputChanged,
+    DefaultOutputSampleRateChanged,
+}
+
+#[derive(Debug)]
+enum SystemAudioMonitorEvent {
+    AggregateDisconnected,
+    AggregateSampleRateChanged,
+    DefaultOutputChanged,
+    DefaultOutputUnavailable,
+    DefaultOutputSampleRateChanged,
+    ListenerFailed(Error),
+}
+
+fn check_shutdown(shutdown_rx: &mpsc::Receiver<()>) -> bool {
+    match shutdown_rx.try_recv() {
+        Ok(()) | Err(mpsc::TryRecvError::Disconnected) => true,
+        Err(mpsc::TryRecvError::Empty) => false,
+    }
+}
+
+fn sample_rate_listener(
+    device_id: AudioDeviceID,
+    tx: mpsc::Sender<SystemAudioListenerEvent>,
+    event: SystemAudioListenerEvent,
+) -> Result<AudioObjectPropertyListener, Error> {
+    AudioObjectPropertyListener::new(
+        device_id,
+        AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        },
+        move || {
+            let _ = tx.send(event);
+        },
+    )
+}
+
+fn default_output_sample_rate_listener(
+    default_output_id: Option<AudioDeviceID>,
+    tx: mpsc::Sender<SystemAudioListenerEvent>,
+) -> Result<Option<AudioObjectPropertyListener>, Error> {
+    default_output_id
+        .map(|device_id| {
+            sample_rate_listener(
+                device_id,
+                tx,
+                SystemAudioListenerEvent::DefaultOutputSampleRateChanged,
+            )
+        })
+        .transpose()
+}
+
+fn spawn_system_audio_monitor_thread(
+    aggregate_device_id: AudioDeviceID,
+) -> Result<(mpsc::Receiver<SystemAudioMonitorEvent>, mpsc::Sender<()>), Error> {
+    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    let (monitor_tx, monitor_rx) = mpsc::channel();
+    let (listener_tx, listener_rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let aggregate_alive_tx = listener_tx.clone();
+        let aggregate_alive_listener = AudioObjectPropertyListener::new(
+            aggregate_device_id,
+            AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyDeviceIsAlive,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            },
+            move || {
+                let _ = aggregate_alive_tx.send(SystemAudioListenerEvent::AggregateDisconnected);
+            },
+        );
+        let aggregate_alive_listener = match aggregate_alive_listener {
+            Ok(listener) => listener,
+            Err(err) => {
+                let _ = ready_tx.send(Err(err));
+                return;
+            }
+        };
+
+        let aggregate_rate_listener = sample_rate_listener(
+            aggregate_device_id,
+            listener_tx.clone(),
+            SystemAudioListenerEvent::AggregateSampleRateChanged,
+        );
+        let aggregate_rate_listener = match aggregate_rate_listener {
+            Ok(listener) => listener,
+            Err(err) => {
+                let _ = ready_tx.send(Err(err));
+                return;
+            }
+        };
+
+        let default_output_tx = listener_tx.clone();
+        let default_output_listener = AudioObjectPropertyListener::new(
+            kAudioObjectSystemObject as AudioObjectID,
+            AudioObjectPropertyAddress {
+                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            },
+            move || {
+                let _ = default_output_tx.send(SystemAudioListenerEvent::DefaultOutputChanged);
+            },
+        );
+        let default_output_listener = match default_output_listener {
+            Ok(listener) => listener,
+            Err(err) => {
+                let _ = ready_tx.send(Err(err));
+                return;
+            }
+        };
+
+        let mut default_output_id = default_output_device().map(|d| d.audio_device_id);
+        let mut _default_rate_listener =
+            match default_output_sample_rate_listener(default_output_id, listener_tx.clone()) {
+                Ok(listener) => listener,
+                Err(err) => {
+                    let _ = ready_tx.send(Err(err));
+                    return;
+                }
+            };
+
+        let _aggregate_alive_listener = aggregate_alive_listener;
+        let _aggregate_rate_listener = aggregate_rate_listener;
+        let _default_output_listener = default_output_listener;
+        let _ = ready_tx.send(Ok(()));
+
+        loop {
+            if check_shutdown(&shutdown_rx) {
+                break;
+            }
+
+            let event = match listener_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(event) => event,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+
+            match event {
+                SystemAudioListenerEvent::AggregateDisconnected => {
+                    let _ = monitor_tx.send(SystemAudioMonitorEvent::AggregateDisconnected);
+                }
+                SystemAudioListenerEvent::AggregateSampleRateChanged => {
+                    let _ = monitor_tx.send(SystemAudioMonitorEvent::AggregateSampleRateChanged);
+                }
+                SystemAudioListenerEvent::DefaultOutputSampleRateChanged => {
+                    let _ =
+                        monitor_tx.send(SystemAudioMonitorEvent::DefaultOutputSampleRateChanged);
+                }
+                SystemAudioListenerEvent::DefaultOutputChanged => {
+                    default_output_id = default_output_device().map(|d| d.audio_device_id);
+                    match default_output_sample_rate_listener(
+                        default_output_id,
+                        listener_tx.clone(),
+                    ) {
+                        Ok(listener) => {
+                            _default_rate_listener = listener;
+                            if default_output_id.is_some() {
+                                let _ =
+                                    monitor_tx.send(SystemAudioMonitorEvent::DefaultOutputChanged);
+                            } else {
+                                let _ = monitor_tx
+                                    .send(SystemAudioMonitorEvent::DefaultOutputUnavailable);
+                            }
+                        }
+                        Err(err) => {
+                            _default_rate_listener = None;
+                            let _ = monitor_tx.send(SystemAudioMonitorEvent::ListenerFailed(
+                                Error::with_message(
+                                    ErrorKind::StreamInvalidated,
+                                    format!(
+                                        "failed to monitor system-audio default output sample rate: {err}"
+                                    ),
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    ready_rx.recv().map_err(|_| {
+        Error::with_message(
+            ErrorKind::StreamInvalidated,
+            "system-audio monitor thread terminated unexpectedly",
+        )
+    })??;
+
+    Ok((monitor_rx, shutdown_tx))
+}
+
+/// Watches the moving clock/format inputs behind the global system-audio tap.
+///
+/// The tap itself is global, but the aggregate device used for IO still has a live clock domain.
+/// A default-output or nominal-rate change can invalidate that stream configuration, so these
+/// events are reported as `StreamInvalidated` and downstream should rebuild the stream.
+struct SystemAudioMonitor {
+    latch: Latch,
+    _shutdown_tx: mpsc::Sender<()>,
+}
+
+impl SystemAudioMonitor {
+    fn new(
+        aggregate_device_id: AudioDeviceID,
+        stream_weak: Weak<Mutex<StreamInner>>,
+        error_callback: Arc<Mutex<ErrorCallback>>,
+    ) -> Result<Self, Error> {
+        let (event_rx, shutdown_tx) = spawn_system_audio_monitor_thread(aggregate_device_id)?;
+
+        let mut latch = Latch::new();
+        let waiter = latch.waiter();
+
+        let handle = std::thread::Builder::new()
+            .name("cpal-coreaudio-system-audio".into())
+            .spawn(move || {
+                if !waiter.wait() {
+                    return;
+                }
+                while let Ok(event) = event_rx.recv() {
+                    let Some(arc) = stream_weak.upgrade() else {
+                        break;
+                    };
+
+                    let err = match event {
+                        SystemAudioMonitorEvent::AggregateDisconnected => {
+                            if let Ok(mut inner) = arc.try_lock() {
+                                let _ = inner.pause();
+                            }
+                            Error::with_message(
+                                ErrorKind::DeviceNotAvailable,
+                                "system audio aggregate device disconnected",
+                            )
+                        }
+                        SystemAudioMonitorEvent::DefaultOutputUnavailable => {
+                            if let Ok(mut inner) = arc.try_lock() {
+                                let _ = inner.pause();
+                            }
+                            Error::with_message(
+                                ErrorKind::DeviceNotAvailable,
+                                "no default output device for system audio",
+                            )
+                        }
+                        SystemAudioMonitorEvent::AggregateSampleRateChanged => {
+                            if let Ok(mut inner) = arc.try_lock() {
+                                let _ = inner.pause();
+                            }
+                            Error::with_message(
+                                ErrorKind::StreamInvalidated,
+                                "system audio aggregate sample rate changed",
+                            )
+                        }
+                        SystemAudioMonitorEvent::DefaultOutputChanged => {
+                            if let Ok(mut inner) = arc.try_lock() {
+                                let _ = inner.pause();
+                            }
+                            Error::with_message(
+                                ErrorKind::StreamInvalidated,
+                                "system audio default output changed",
+                            )
+                        }
+                        SystemAudioMonitorEvent::DefaultOutputSampleRateChanged => {
+                            if let Ok(mut inner) = arc.try_lock() {
+                                let _ = inner.pause();
+                            }
+                            Error::with_message(
+                                ErrorKind::StreamInvalidated,
+                                "system audio default output sample rate changed",
+                            )
+                        }
+                        SystemAudioMonitorEvent::ListenerFailed(err) => {
+                            if let Ok(mut inner) = arc.try_lock() {
+                                let _ = inner.pause();
+                            }
+                            err
+                        }
+                    };
+                    emit_error(&error_callback, err);
+                }
+            })
+            .map_err(|e| {
+                Error::with_message(
+                    ErrorKind::ResourceExhausted,
+                    format!("failed to spawn system-audio monitor thread: {e}"),
+                )
+            })?;
+
+        latch.add_thread(handle.thread().clone());
+        Ok(Self {
+            latch,
+            _shutdown_tx: shutdown_tx,
+        })
+    }
+}
+
+impl Monitor for SystemAudioMonitor {
     fn signal_ready(&self) {
         self.latch.release();
     }
